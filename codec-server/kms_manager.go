@@ -150,10 +150,9 @@ func (k *KMSManager) DecryptDataKey(ctx context.Context, encryptedKey string, ma
 	// Check decryption cache for older keys
 	k.mux.RLock()
 	cacheKey := fmt.Sprintf("%s:%s", encryptedKey, masterKeyARN)
-	if cached, exists := k.decryptionCache[cacheKey]; exists && time.Now().Before(cached.ExpiresAt) {
-		key := cached.Key
+	if cached, exists := k.decryptionCache[cacheKey]; exists {
 		k.mux.RUnlock()
-		return key, nil
+		return cached.Key, nil
 	}
 	k.mux.RUnlock()
 

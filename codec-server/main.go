@@ -125,7 +125,7 @@ func (c *KMSEncryptionCodec) handleDecode(w http.ResponseWriter, r *http.Request
 		}
 
 		// Decrypt the data key using KMS (with intelligent caching)
-		dataKey, err := c.kmsManager.DecryptDataKey(ctx, payload.EncryptedDataKey)
+		dataKey, err := c.kmsManager.DecryptDataKey(ctx, payload.EncryptedDataKey, payload.KMSKeyID)
 		if err != nil {
 			log.Printf("Failed to decrypt data key: %v", err)
 			http.Error(w, "Key decryption failed: "+err.Error(), http.StatusInternalServerError)
