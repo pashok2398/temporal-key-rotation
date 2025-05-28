@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -11,6 +12,10 @@ import (
 	"time"
 
 	"temporal-worker/shared"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/kms"
 )
 
 // KMSEncryptionCodec handles encryption/decryption of payloads using AWS KMS
@@ -174,13 +179,41 @@ func (c *KMSEncryptionCodec) handleStats(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-func main() {
-	// Get KMS configuration from environment variables
-	kmsKeyID := os.Getenv("KMS_KEY_ID")
-	if kmsKeyID == "" {
-		log.Fatal("KMS_KEY_ID environment variable is required")
+func resolveKMSAlias(alias string) (string, error) {
+	// Create AWS config
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		return "", fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
+	// Create KMS client
+	kmsClient := kms.NewFromConfig(cfg)
+
+	// Resolve the alias
+	result, err := kmsClient.DescribeKey(context.TODO(), &kms.DescribeKeyInput{
+		KeyId: aws.String(alias),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve alias %s: %w", alias, err)
+	}
+
+	return *result.KeyMetadata.Arn, nil
+}
+
+func main() {
+	// Get alias from environment
+	keyAlias := os.Getenv("KMS_KEY_ALIAS")
+	if keyAlias == "" {
+		keyAlias = "alias/temporal-codec-latest" // Default
+	}
+
+	// Resolve alias to actual key ARN
+	actualKeyARN, err := resolveKMSAlias(keyAlias)
+	if err != nil {
+		log.Fatalf("Failed to resolve KMS alias %s: %v", keyAlias, err)
+	}
+
+	log.Printf("Using KMS alias: %s → %s", keyAlias, actualKeyARN)
 	// Parse cache TTL for old keys
 	cacheTTLStr := os.Getenv("KMS_CACHE_TTL")
 	cacheTTL := 24 * time.Hour // default - keep old keys cached for 24 hours
@@ -200,7 +233,7 @@ func main() {
 	}
 
 	// Initialize KMS manager with time-based rotation
-	kmsManager, err := NewKMSManager(kmsKeyID, cacheTTL, rotationInterval)
+	kmsManager, err := NewKMSManager(actualKeyARN, cacheTTL, rotationInterval)
 	if err != nil {
 		log.Fatalf("Failed to initialize KMS manager: %v", err)
 	}
@@ -227,7 +260,7 @@ func main() {
 	}
 
 	log.Printf("KMS Codec server starting on port %s", port)
-	log.Printf("Using KMS Key: %s", kmsKeyID)
+	log.Printf("Using KMS Key: %s", actualKeyARN)
 	log.Printf("Data key rotation interval: %v", rotationInterval)
 	log.Printf("Decryption cache TTL: %v", cacheTTL)
 	log.Printf("Endpoints: /encode, /decode, /stats, /health")
