@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"os"
 
-	"temporal-worker/shared"
+	"temporal-key-rotation/shared"
 
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"

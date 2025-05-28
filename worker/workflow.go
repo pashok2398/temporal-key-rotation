@@ -3,7 +3,7 @@ package main
 import (
 	"time"
 
-	"temporal-worker/shared"
+	"temporal-key-rotation/shared"
 
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"

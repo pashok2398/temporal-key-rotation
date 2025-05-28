@@ -1,4 +1,4 @@
-module temporal-worker
+module temporal-key-rotation
 
 go 1.24.2
 

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 
-	"temporal-worker/shared"
+	"temporal-key-rotation/shared"
 )
 
 type Activities struct {

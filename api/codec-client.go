@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"temporal-worker/shared"
+	"temporal-key-rotation/shared"
 
 	commonpb "go.temporal.io/api/common/v1"
 )
