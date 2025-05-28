@@ -68,6 +68,8 @@ AWS KMS Master Key ─► Encrypted Data Key
   "algorithm": "AES-256-GCM"                                       // encryption algorithm
 }
 ```
+![image](https://github.com/user-attachments/assets/7396b3b8-37fd-43df-b660-ecae76cf8075)
+
 
 ## 🚀 Caching System
 
