@@ -43,7 +43,6 @@ func (c *RemoteCodecClient) Encode(payloads []*commonpb.Payload) ([]*commonpb.Pa
 			metadata[key] = string(value)
 		}
 
-		// Encode binary data as base64 for safe transport
 		request.Payloads[i] = shared.PayloadData{
 			Metadata: metadata,
 			Data:     base64.StdEncoding.EncodeToString(payload.Data),
@@ -59,20 +58,17 @@ func (c *RemoteCodecClient) Encode(payloads []*commonpb.Payload) ([]*commonpb.Pa
 	// Convert response back to Temporal payloads
 	result := make([]*commonpb.Payload, len(response.Payloads))
 	for i, payloadData := range response.Payloads {
-		metadata := make(map[string][]byte)
-		for key, value := range payloadData.Metadata {
-			metadata[key] = []byte(value)
-		}
-
-		// Decode base64 data back to binary
-		data, err := base64.StdEncoding.DecodeString(payloadData.Data)
+		// SERIALIZE THE ENTIRE PayloadData struct as JSON
+		serializedPayload, err := json.Marshal(payloadData)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode base64 data: %w", err)
+			return nil, fmt.Errorf("failed to serialize payload data: %w", err)
 		}
 
 		result[i] = &commonpb.Payload{
-			Metadata: metadata,
-			Data:     data,
+			Metadata: map[string][]byte{
+				"encoding": []byte("temporal-codec"), // Mark as codec-processed
+			},
+			Data: serializedPayload, // Store entire PayloadData as JSON
 		}
 	}
 
@@ -91,16 +87,19 @@ func (c *RemoteCodecClient) Decode(payloads []*commonpb.Payload) ([]*commonpb.Pa
 	}
 
 	for i, payload := range payloads {
-		metadata := make(map[string]string)
-		for key, value := range payload.Metadata {
-			metadata[key] = string(value)
+		// Check if this was processed by our codec
+		if string(payload.Metadata["encoding"]) != "temporal-codec" {
+			// Not our payload, return as-is
+			return []*commonpb.Payload{payload}, nil
 		}
 
-		// Encode binary data as base64 for safe transport
-		request.Payloads[i] = shared.PayloadData{
-			Metadata: metadata,
-			Data:     base64.StdEncoding.EncodeToString(payload.Data),
+		// DESERIALIZE the PayloadData struct from JSON
+		var payloadData shared.PayloadData
+		if err := json.Unmarshal(payload.Data, &payloadData); err != nil {
+			return nil, fmt.Errorf("failed to deserialize payload data: %w", err)
 		}
+
+		request.Payloads[i] = payloadData // This includes ALL KMS fields
 	}
 
 	// Send decode request to codec server
@@ -125,7 +124,7 @@ func (c *RemoteCodecClient) Decode(payloads []*commonpb.Payload) ([]*commonpb.Pa
 
 		result[i] = &commonpb.Payload{
 			Metadata: metadata,
-			Data:     data,
+			Data:     data, // Original decrypted data
 		}
 	}
 
