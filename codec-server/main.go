@@ -1,88 +1,32 @@
 package main
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
+	"context"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"time"
 
 	"temporal-worker/shared"
 )
 
-// EncryptionCodec handles encryption/decryption of payloads
-type EncryptionCodec struct {
-	keyID string
-	key   []byte
+// KMSEncryptionCodec handles encryption/decryption of payloads using AWS KMS
+type KMSEncryptionCodec struct {
+	kmsManager *KMSManager
 }
 
-// NewEncryptionCodec creates a new encryption codec with a 32-byte key
-func NewEncryptionCodec(key []byte, keyID string) *EncryptionCodec {
-	if len(key) != 32 {
-		panic("Key must be 32 bytes for AES-256")
+// NewKMSEncryptionCodec creates a new KMS encryption codec
+func NewKMSEncryptionCodec(kmsManager *KMSManager) *KMSEncryptionCodec {
+	return &KMSEncryptionCodec{
+		kmsManager: kmsManager,
 	}
-	return &EncryptionCodec{key: key, keyID: keyID}
-}
-
-// encrypt encrypts data using AES-GCM and returns base64 encoded result
-func (c *EncryptionCodec) encrypt(data []byte) (string, error) {
-	block, err := aes.NewCipher(c.key)
-	if err != nil {
-		return "", err
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return "", err
-	}
-
-	ciphertext := gcm.Seal(nonce, nonce, data, nil)
-	return base64.StdEncoding.EncodeToString(ciphertext), nil
-}
-
-// decrypt decrypts base64 encoded data using AES-GCM
-func (c *EncryptionCodec) decrypt(encodedData string) ([]byte, error) {
-	data, err := base64.StdEncoding.DecodeString(encodedData)
-	if err != nil {
-		return nil, fmt.Errorf("base64 decode failed: %w", err)
-	}
-
-	block, err := aes.NewCipher(c.key)
-	if err != nil {
-		return nil, err
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-
-	nonceSize := gcm.NonceSize()
-	if len(data) < nonceSize {
-		return nil, fmt.Errorf("ciphertext too short")
-	}
-
-	nonce, ciphertext := data[:nonceSize], data[nonceSize:]
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return plaintext, nil
 }
 
 // handleEncode handles the /encode endpoint
-func (c *EncryptionCodec) handleEncode(w http.ResponseWriter, r *http.Request) {
+func (c *KMSEncryptionCodec) handleEncode(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -95,11 +39,21 @@ func (c *EncryptionCodec) handleEncode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var response shared.CodecResponse
+	ctx := context.Background()
+
 	for _, payload := range req.Payloads {
 		// Only process JSON payloads that aren't already encrypted
 		encoding, exists := payload.Metadata["encoding"]
 		if !exists || encoding == "json/plain" {
-			// Encrypt the data (input is base64 decoded first if needed)
+			// Get current data key (with automatic rotation)
+			currentKey, err := c.kmsManager.GetCurrentDataKey(ctx)
+			if err != nil {
+				log.Printf("Failed to get current data key: %v", err)
+				http.Error(w, "Key retrieval failed: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			// Prepare data to encrypt
 			var dataToEncrypt []byte
 			if payload.Data != "" {
 				// Try to decode as base64 first, if it fails, use as plain text
@@ -110,25 +64,26 @@ func (c *EncryptionCodec) handleEncode(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			encryptedData, err := c.encrypt(dataToEncrypt)
+			// Encrypt the data with the current data key
+			encryptedData, err := EncryptWithDataKey(dataToEncrypt, currentKey.PlaintextKey)
 			if err != nil {
+				log.Printf("Failed to encrypt data: %v", err)
 				http.Error(w, "Encryption failed: "+err.Error(), http.StatusInternalServerError)
 				return
 			}
 
-			// Create response payload
+			// Create response payload with KMS metadata
 			encodedPayload := shared.PayloadData{
 				Metadata: map[string]string{
 					"encoding": "binary/encrypted",
-					"keyID":    c.keyID,
 				},
-				Data: encryptedData,
+				Data:             encryptedData,
+				KMSKeyID:         c.kmsManager.keyID,
+				EncryptedDataKey: currentKey.EncryptedKey,
+				Algorithm:        "AES-256-GCM",
 			}
 
 			response.Payloads = append(response.Payloads, encodedPayload)
-		} else {
-			// Already encrypted or different encoding, return as-is
-			response.Payloads = append(response.Payloads, payload)
 		}
 	}
 
@@ -139,7 +94,7 @@ func (c *EncryptionCodec) handleEncode(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDecode handles the /decode endpoint
-func (c *EncryptionCodec) handleDecode(w http.ResponseWriter, r *http.Request) {
+func (c *KMSEncryptionCodec) handleDecode(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -152,6 +107,8 @@ func (c *EncryptionCodec) handleDecode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var response shared.CodecResponse
+	ctx := context.Background()
+
 	for _, payload := range req.Payloads {
 		// Check if this payload is encrypted
 		if payload.Metadata["encoding"] != "binary/encrypted" {
@@ -160,18 +117,36 @@ func (c *EncryptionCodec) handleDecode(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Decrypt the data
-		decryptedData, err := c.decrypt(payload.Data)
-		if err != nil {
-			http.Error(w, "Decryption failed: "+err.Error(), http.StatusInternalServerError)
+		// For KMS encrypted payloads, we need the encrypted data key
+		if payload.EncryptedDataKey == "" {
+			log.Printf("Missing encrypted data key for encrypted payload")
+			http.Error(w, "Missing encrypted data key", http.StatusBadRequest)
 			return
 		}
+
+		// Decrypt the data key using KMS (with intelligent caching)
+		dataKey, err := c.kmsManager.DecryptDataKey(ctx, payload.EncryptedDataKey)
+		if err != nil {
+			log.Printf("Failed to decrypt data key: %v", err)
+			http.Error(w, "Key decryption failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Decrypt the actual data
+		decryptedData, err := DecryptWithDataKey(payload.Data, dataKey)
+		if err != nil {
+			log.Printf("Failed to decrypt payload data: %v", err)
+			http.Error(w, "Data decryption failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Note: dataKey is not zeroed here as it might be cached for reuse
+		// The KMSManager handles secure memory management
 
 		// Create response payload with base64 encoded decrypted data
 		decodedPayload := shared.PayloadData{
 			Metadata: map[string]string{
 				"encoding": "json/plain",
-				"keyID":    c.keyID,
 			},
 			Data: base64.StdEncoding.EncodeToString(decryptedData),
 		}
@@ -185,24 +160,60 @@ func (c *EncryptionCodec) handleDecode(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleStats handles the /stats endpoint for monitoring
+func (c *KMSEncryptionCodec) handleStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	stats := c.kmsManager.GetKeyStats()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(stats); err != nil {
+		log.Printf("Failed to encode stats response: %v", err)
+	}
+}
+
 func main() {
-	// Get encryption key from environment variable or use default (not recommended for production)
-	keyStr := os.Getenv("CODEC_KEY")
-	if keyStr == "" {
-		log.Println("WARNING: Using default key. Set CODEC_KEY environment variable for production!")
-		keyStr = "12345678901234567890123456789012" // 32 bytes
+	// Get KMS configuration from environment variables
+	kmsKeyID := os.Getenv("KMS_KEY_ID")
+	if kmsKeyID == "" {
+		log.Fatal("KMS_KEY_ID environment variable is required")
 	}
 
-	if len(keyStr) != 32 {
-		log.Fatal("CODEC_KEY must be exactly 32 bytes")
+	// Parse cache TTL for old keys
+	cacheTTLStr := os.Getenv("KMS_CACHE_TTL")
+	cacheTTL := 24 * time.Hour // default - keep old keys cached for 24 hours
+	if cacheTTLStr != "" {
+		if ttl, err := strconv.Atoi(cacheTTLStr); err == nil {
+			cacheTTL = time.Duration(ttl) * time.Second
+		}
 	}
-	keyID := "123abc"
 
-	codec := NewEncryptionCodec([]byte(keyStr), keyID)
+	// Parse key rotation interval
+	rotationIntervalStr := os.Getenv("DATA_KEY_ROTATION_INTERVAL")
+	rotationInterval := 1 * time.Hour // default - rotate every hour
+	if rotationIntervalStr != "" {
+		if interval, err := strconv.Atoi(rotationIntervalStr); err == nil {
+			rotationInterval = time.Duration(interval) * time.Second
+		}
+	}
+
+	// Initialize KMS manager with time-based rotation
+	kmsManager, err := NewKMSManager(kmsKeyID, cacheTTL, rotationInterval)
+	if err != nil {
+		log.Fatalf("Failed to initialize KMS manager: %v", err)
+	}
+
+	// Start background maintenance routines
+	kmsManager.StartCacheCleanup(15 * time.Minute)
+
+	codec := NewKMSEncryptionCodec(kmsManager)
 
 	// Set up routes
 	http.HandleFunc("/encode", codec.handleEncode)
 	http.HandleFunc("/decode", codec.handleDecode)
+	http.HandleFunc("/stats", codec.handleStats)
 
 	// Health check endpoint
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -215,7 +226,10 @@ func main() {
 		port = "8081"
 	}
 
-	log.Printf("Codec server starting on port %s", port)
-	log.Printf("Endpoints: /encode, /decode, /health")
+	log.Printf("KMS Codec server starting on port %s", port)
+	log.Printf("Using KMS Key: %s", kmsKeyID)
+	log.Printf("Data key rotation interval: %v", rotationInterval)
+	log.Printf("Decryption cache TTL: %v", cacheTTL)
+	log.Printf("Endpoints: /encode, /decode, /stats, /health")
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
